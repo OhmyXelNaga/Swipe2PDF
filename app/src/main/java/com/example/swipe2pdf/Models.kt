@@ -5,12 +5,15 @@ import kotlin.math.roundToInt
 
 enum class JobState { Idle, Preparing, Capturing, Paused, Processing, Completed, Error }
 
+data class PixelRect(val left:Int,val top:Int,val right:Int,val bottom:Int)
+
 data class NormalizedRect(val left: Float, val top: Float, val right: Float, val bottom: Float) {
     fun valid() = left in 0f..1f && top in 0f..1f && right in 0f..1f && bottom in 0f..1f && left < right && top < bottom
-    fun pixels(width: Int, height: Int): Rect {
+    fun pixelBounds(width:Int,height:Int):PixelRect {
         require(valid() && width > 0 && height > 0)
-        return Rect((left * width).roundToInt(), (top * height).roundToInt(), (right * width).roundToInt(), (bottom * height).roundToInt())
+        return PixelRect((left*width).roundToInt(),(top*height).roundToInt(),(right*width).roundToInt(),(bottom*height).roundToInt())
     }
+    fun pixels(width:Int,height:Int):Rect { val p=pixelBounds(width,height);return Rect(p.left,p.top,p.right,p.bottom) }
 }
 
 data class JobConfig(

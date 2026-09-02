@@ -10,6 +10,8 @@ import android.provider.MediaStore
 import java.io.File
 import kotlin.math.max
 
+private inline fun <R> PdfDocument.usePdf(block:(PdfDocument)->R):R=try{block(this)}finally{close()}
+
 object ImageAndPdf {
     fun cropFile(source: File, crop: NormalizedRect): Bitmap {
         val bounds=BitmapFactory.Options().apply { inJustDecodeBounds=true }; BitmapFactory.decodeFile(source.path,bounds)
@@ -34,7 +36,7 @@ object ImageAndPdf {
         context.contentResolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI,arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),"${MediaStore.MediaColumns.RELATIVE_PATH}=?",arrayOf("${Environment.DIRECTORY_DOWNLOADS}/Swipe2PDF/"),null)?.use{c->while(c.moveToNext())existing+=c.getString(0)}
         val name=uniqueName(existing,requested);val values=ContentValues().apply{put(MediaStore.MediaColumns.DISPLAY_NAME,name);put(MediaStore.MediaColumns.MIME_TYPE,"application/pdf");put(MediaStore.MediaColumns.RELATIVE_PATH,"${Environment.DIRECTORY_DOWNLOADS}/Swipe2PDF/");put(MediaStore.MediaColumns.IS_PENDING,1)}
         val uri=context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,values)?:error("PDF 저장 위치를 만들 수 없습니다.")
-        try { PdfDocument().use { pdf -> files.forEachIndexed { index,file -> val bmp=cropFile(file,crop);val maxSide=2000f;val scale=minOf(1f,maxSide/max(bmp.width,bmp.height));val pw=max(1,(bmp.width*scale).toInt());val ph=max(1,(bmp.height*scale).toInt());val page=pdf.startPage(PdfDocument.PageInfo.Builder(pw,ph,index+1).create());page.canvas.drawBitmap(bmp,null,Rect(0,0,pw,ph),Paint(Paint.FILTER_BITMAP_FLAG));pdf.finishPage(page);bmp.recycle() }; context.contentResolver.openOutputStream(uri,"w")!!.use(pdf::writeTo) }; values.clear();values.put(MediaStore.MediaColumns.IS_PENDING,0);context.contentResolver.update(uri,values,null,null);return uri to name }
+        try { PdfDocument().usePdf { pdf -> files.forEachIndexed { index,file -> val bmp=cropFile(file,crop);val maxSide=2000f;val scale=minOf(1f,maxSide/max(bmp.width,bmp.height));val pw=max(1,(bmp.width*scale).toInt());val ph=max(1,(bmp.height*scale).toInt());val page=pdf.startPage(PdfDocument.PageInfo.Builder(pw,ph,index+1).create());page.canvas.drawBitmap(bmp,null,Rect(0,0,pw,ph),Paint(Paint.FILTER_BITMAP_FLAG));pdf.finishPage(page);bmp.recycle() }; context.contentResolver.openOutputStream(uri,"w")!!.use(pdf::writeTo) }; values.clear();values.put(MediaStore.MediaColumns.IS_PENDING,0);context.contentResolver.update(uri,values,null,null);return uri to name }
         catch(t:Throwable){context.contentResolver.delete(uri,null,null);throw t}
     }
 }
