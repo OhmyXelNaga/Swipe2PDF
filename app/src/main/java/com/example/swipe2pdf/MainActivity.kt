@@ -2,60 +2,344 @@ package com.example.swipe2pdf
 
 import android.Manifest
 import android.app.Activity
-import android.content.*
+import android.app.DownloadManager
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
-import android.os.*
+import android.os.Build
+import android.os.Bundle
 import android.provider.Settings
-import android.provider.MediaStore
-import android.view.accessibility.AccessibilityManager
+import android.util.LruCache
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.*
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import java.io.File
 
-class MainActivity:ComponentActivity(){override fun onCreate(savedInstanceState:Bundle?){super.onCreate(savedInstanceState);setContent{MaterialTheme{SwipeApp()}}}}
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        AppState.restoreCaptures(filesDir)
+        setContent { MaterialTheme { SwipeApp() } }
+    }
+}
+
+private val ACTIVE_STATES = setOf(JobState.Preparing, JobState.Capturing, JobState.Paused, JobState.Processing)
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable fun SwipeApp(){
-    val context=LocalContext.current;val activity=context as Activity;val store=remember{SettingsStore(context)};val persisted by store.config.collectAsState(initial=JobConfig());var c by remember(persisted){mutableStateOf(persisted)};val scope=rememberCoroutineScope();val captures by AppState.captures.collectAsStateWithLifecycle();val state by AppState.state.collectAsStateWithLifecycle();val msg by AppState.message.collectAsStateWithLifecycle();var tab by remember{mutableIntStateOf(if(captures.isEmpty())0 else 2)};var projectionReady by remember{mutableStateOf(false)};var projectionResult by remember{mutableStateOf<Pair<Int,Intent>?>(null)}
-    val projection=rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()){if(it.resultCode==Activity.RESULT_OK&&it.data!=null){projectionReady=true;projectionResult=it.resultCode to it.data!!}else AppState.message.value="화면 캡처 권한이 허용되지 않았습니다."}
-    val notification=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){}
-    LaunchedEffect(captures.size,state){if(captures.isNotEmpty()&&(state==JobState.Processing||state==JobState.Error))tab=2}
-    Scaffold(topBar={TopAppBar(title={Text("Swipe2PDF")})}){pad->Column(Modifier.padding(pad).fillMaxSize()){TabRow(tab){listOf("권한","작업 설정","결과 검토").forEachIndexed{i,s->Tab(tab==i,{tab=i},text={Text(s)})}};msg?.let{AssistChip({AppState.message.value=null},label={Text(it)})};when(tab){0->Permissions(projectionReady,{val m=context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager;projection.launch(m.createScreenCaptureIntent())},notification);1->ConfigScreen(c,{c=it;scope.launch{store.save(it)}},{
-            val pr=projectionResult;if(pr==null){AppState.message.value="먼저 권한 화면에서 화면 캡처에 동의해 주세요.";tab=0}else if(!Settings.canDrawOverlays(context)){AppState.message.value="다른 앱 위에 표시 권한이 필요합니다.";tab=0}else if(SwipeAccessibilityService.instance==null){AppState.message.value="접근성 서비스를 켜 주세요.";tab=0}else{scope.launch{store.save(c)};ContextCompat.startForegroundService(context,Intent(context,CaptureService::class.java).putExtra(CaptureService.EXTRA_RESULT,pr.first).putExtra(CaptureService.EXTRA_DATA,pr.second).putExtra(CaptureService.EXTRA_CONFIG,ConfigCodec.encode(c)));projectionReady=false;projectionResult=null;AppState.message.value="플로팅 컨트롤러가 켜졌습니다. 대상 앱으로 이동해 시작 상태를 확인하세요."}});else->ReviewScreen(c,captures,{AppState.captures.value=it})}}
-    }}
+@Composable
+fun SwipeApp() {
+    val context = LocalContext.current
+    val store = remember { SettingsStore(context.applicationContext) }
+    var config by remember { mutableStateOf<JobConfig?>(null) }
+    LaunchedEffect(Unit) { config = store.config.first() }
+    val state by AppState.state.collectAsStateWithLifecycle()
+    val captures by AppState.captures.collectAsStateWithLifecycle()
+    val msg by AppState.message.collectAsStateWithLifecycle()
+    var tab by rememberSaveable { mutableIntStateOf(if (captures.isEmpty()) 0 else 2) }
+    var projectionResult by remember { mutableStateOf<Pair<Int, Intent>?>(null) }
+    var startAfterConsent by remember { mutableStateOf(false) }
 
-@Composable private fun Permissions(projectionReady:Boolean,onProjection:()->Unit,notification:androidx.activity.result.ActivityResultLauncher<String>){val context=LocalContext.current;var tick by remember{mutableIntStateOf(0)};val access=SwipeAccessibilityService.instance!=null;val overlay=Settings.canDrawOverlays(context);val notif=Build.VERSION.SDK_INT<33||ContextCompat.checkSelfPermission(context,Manifest.permission.POST_NOTIFICATIONS)==PackageManager.PERMISSION_GRANTED
-    Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){Text("필수 권한 설정",style=MaterialTheme.typography.headlineSmall);PermissionRow("접근성 서비스",access,"오른쪽에서 왼쪽으로 스와이프 동작을 수행합니다."){context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));tick++};PermissionRow("화면 캡처 동의",projectionReady,"Android 시스템 확인창에서 현재 화면 캡처를 허용합니다. 새 작업마다 다시 동의해야 할 수 있습니다.",onProjection);PermissionRow("알림",notif,"캡처 중 필수 상시 알림을 표시합니다."){if(Build.VERSION.SDK_INT>=33)notification.launch(Manifest.permission.POST_NOTIFICATIONS)};PermissionRow("다른 앱 위에 표시",overlay,"대상 앱에서도 시작·일시정지·중지 컨트롤러를 표시합니다."){context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,Uri.parse("package:${context.packageName}")));tick++};Button({tick++}){Text("권한 상태 새로고침")}}
+    val projectionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val data = r.data
+        if (r.resultCode == Activity.RESULT_OK && data != null) {
+            projectionResult = r.resultCode to data
+        } else {
+            startAfterConsent = false
+            AppState.message.value = "화면 캡처 권한이 허용되지 않았습니다."
+        }
+    }
+    val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    val requestProjection = {
+        val m = context.getSystemService(MediaProjectionManager::class.java)!!
+        projectionLauncher.launch(m.createScreenCaptureIntent())
+    }
+
+    fun startJob(c: JobConfig) {
+        val pr = projectionResult
+        when {
+            state in ACTIVE_STATES -> AppState.message.value = "이미 진행 중인 작업이 있습니다."
+            !Settings.canDrawOverlays(context) -> { AppState.message.value = "다른 앱 위에 표시 권한이 필요합니다."; tab = 0 }
+            SwipeAccessibilityService.instance == null -> { AppState.message.value = "접근성 서비스를 켜 주세요."; tab = 0 }
+            pr == null -> { startAfterConsent = true; requestProjection() }
+            else -> {
+                store.saveLater(c)
+                context.startForegroundService(
+                    Intent(context, CaptureService::class.java)
+                        .putExtra(CaptureService.EXTRA_RESULT, pr.first)
+                        .putExtra(CaptureService.EXTRA_DATA, pr.second)
+                        .putExtra(CaptureService.EXTRA_CONFIG, ConfigCodec.encode(c))
+                )
+                // 화면 캡처 동의는 한 번만 사용할 수 있다.
+                projectionResult = null
+                AppState.message.value = "플로팅 컨트롤러가 켜졌습니다. 대상 앱으로 이동해 시작을 누르세요."
+            }
+        }
+    }
+
+    LaunchedEffect(projectionResult) {
+        val c = config
+        if (projectionResult != null && startAfterConsent && c != null) {
+            startAfterConsent = false
+            startJob(c)
+        }
+    }
+    LaunchedEffect(state) {
+        if (AppState.captures.value.isNotEmpty() && (state == JobState.Reviewing || state == JobState.Error)) tab = 2
+    }
+
+    Scaffold(topBar = { TopAppBar(title = { Text("Swipe2PDF") }) }) { pad ->
+        Column(Modifier.padding(pad).fillMaxSize()) {
+            TabRow(tab) {
+                listOf("권한", "작업 설정", "결과 검토").forEachIndexed { i, s -> Tab(tab == i, { tab = i }, text = { Text(s) }) }
+            }
+            msg?.let { AssistChip({ AppState.message.value = null }, label = { Text(it) }, modifier = Modifier.padding(horizontal = 12.dp)) }
+            val c = config
+            when {
+                tab == 0 -> PermissionsScreen(projectionResult != null, requestProjection) {
+                    if (Build.VERSION.SDK_INT >= 33) notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+                c == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                tab == 1 -> ConfigScreen(
+                    c, captures.firstOrNull(), state !in ACTIVE_STATES,
+                    onChange = { config = it; store.saveLater(it) },
+                    onStart = { startJob(c) }
+                )
+                else -> ReviewScreen(c, captures, state)
+            }
+        }
+    }
 }
-@Composable private fun PermissionRow(title:String,ok:Boolean,desc:String,action:()->Unit){Card(Modifier.fillMaxWidth()){Column(Modifier.padding(12.dp)){Text("$title · ${if(ok)"허용됨" else "필요함"}",fontWeight=FontWeight.Bold,color=if(ok)Color(0xff19794b)else MaterialTheme.colorScheme.error);Text(desc);Button(action){Text(if(ok)"설정 열기" else "허용하기")}}}}
 
-@Composable private fun ConfigScreen(c:JobConfig,onChange:(JobConfig)->Unit,onEnable:()->Unit){Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp),verticalArrangement=Arrangement.spacedBy(10.dp)){Text("캡처 설정",style=MaterialTheme.typography.headlineSmall);NumberField("총 출력 페이지 (1~999)",c.pages.toString()){it.toIntOrNull()?.coerceIn(1,999)?.let{v->onChange(c.copy(pages=v))}};PercentSlider("스와이프 시작 X",c.startX){onChange(c.copy(startX=it))};PercentSlider("스와이프 끝 X",c.endX){onChange(c.copy(endX=it))};PercentSlider("스와이프 Y",c.y){onChange(c.copy(y=it))};NumberField("제스처 시간(ms)",c.gestureMs.toString()){it.toLongOrNull()?.coerceIn(100,3000)?.let{v->onChange(c.copy(gestureMs=v))}};NumberField("페이지 전환 대기(ms)",c.delayMs.toString()){it.toLongOrNull()?.coerceIn(100,10000)?.let{v->onChange(c.copy(delayMs=v))}};Text("공통 자르기 영역",fontWeight=FontWeight.Bold);Box(Modifier.fillMaxWidth().aspectRatio(.55f).background(Color(0xffdddddd))){Box(Modifier.fillMaxWidth(c.crop.right-c.crop.left).fillMaxHeight(c.crop.bottom-c.crop.top).offset(x=(c.crop.left*300).dp,y=(c.crop.top*300).dp).border(3.dp,Color.Red))};PercentSlider("위쪽",c.crop.top,0f,c.crop.bottom-.02f){onChange(c.copy(crop=c.crop.copy(top=it)))};PercentSlider("아래쪽",c.crop.bottom,c.crop.top+.02f,1f){onChange(c.copy(crop=c.crop.copy(bottom=it)))};PercentSlider("왼쪽",c.crop.left,0f,c.crop.right-.02f){onChange(c.copy(crop=c.crop.copy(left=it)))};PercentSlider("오른쪽",c.crop.right,c.crop.left+.02f,1f){onChange(c.copy(crop=c.crop.copy(right=it)))};OutlinedTextField(c.filename,{onChange(c.copy(filename=it))},label={Text("출력 파일 이름")},modifier=Modifier.fillMaxWidth());Text("첫 화면을 먼저 캡처하며 ${c.pages}장 촬영 시 스와이프는 ${CapturePlan.swipesFor(c.pages)}회입니다.");Button(onEnable,Modifier.fillMaxWidth()){Text("플로팅 컨트롤러 켜기")}}
+@Composable
+private fun PermissionsScreen(projectionReady: Boolean, onProjection: () -> Unit, onNotification: () -> Unit) {
+    val context = LocalContext.current
+    // 설정 화면에서 돌아올 때마다 권한 상태를 다시 읽는다.
+    var tick by remember { mutableIntStateOf(0) }
+    LifecycleResumeEffect(Unit) {
+        tick++
+        onPauseOrDispose { }
+    }
+    val access = remember(tick) { SwipeAccessibilityService.instance != null }
+    val overlay = remember(tick) { Settings.canDrawOverlays(context) }
+    val notif = remember(tick) {
+        Build.VERSION.SDK_INT < 33 || context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    }
+    Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("필수 권한 설정", style = MaterialTheme.typography.headlineSmall)
+        PermissionRow("접근성 서비스", access, "오른쪽에서 왼쪽으로 스와이프 동작을 수행합니다.") {
+            context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+        PermissionRow("화면 캡처 동의", projectionReady, "Android 시스템 확인창에서 현재 화면 캡처를 허용합니다. 작업을 시작할 때 동의하지 않았다면 자동으로 요청합니다.", onProjection)
+        PermissionRow("알림", notif, "캡처 중 필수 상시 알림을 표시합니다.", onNotification)
+        PermissionRow("다른 앱 위에 표시", overlay, "대상 앱에서도 시작·일시정지·중지 컨트롤러를 표시합니다.") {
+            context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
+        }
+        Button({ tick++ }) { Text("권한 상태 새로고침") }
+    }
 }
-@Composable private fun NumberField(label:String,value:String,onValue:(String)->Unit)=OutlinedTextField(value,onValue,label={Text(label)},singleLine=true,modifier=Modifier.fillMaxWidth())
-@Composable private fun PercentSlider(label:String,value:Float,min:Float=0f,max:Float=1f,onValue:(Float)->Unit){Column{Text("$label: ${(value*100).toInt()}%");Slider(value,onValue,valueRange=min..max)}}
 
-@Composable private fun ReviewScreen(c:JobConfig,files:List<File>,setFiles:(List<File>)->Unit){val context=LocalContext.current;val scope=rememberCoroutineScope();var selected by remember{mutableIntStateOf(0)};var duplicates by remember(files){mutableStateOf<Set<Int>>(emptySet())};val pdf by AppState.pdf.collectAsStateWithLifecycle();LaunchedEffect(files){duplicates=withContext(Dispatchers.IO){files.zipWithNext().mapIndexedNotNull{i,(a,b)->if(ImageAndPdf.similarity(a,b)>.985)i+1 else null}.toSet()}}
-    Column(Modifier.fillMaxSize().padding(12.dp)){Text("촬영 결과 ${files.size}장",style=MaterialTheme.typography.headlineSmall);if(duplicates.isNotEmpty())Text("유사한 연속 이미지가 있습니다: ${duplicates.map{it+1}.joinToString()}쪽",color=MaterialTheme.colorScheme.error);LazyRow(Modifier.height(130.dp)){itemsIndexed(files){i,f->Card({selected=i},Modifier.width(90.dp).padding(3.dp)){Column{androidx.compose.foundation.Image(android.graphics.BitmapFactory.decodeFile(f.path).asImageBitmap(),null,Modifier.height(90.dp).fillMaxWidth(),contentScale=ContentScale.Crop);Text("${i+1}쪽${if(i in duplicates)" ⚠" else ""}")}}}};if(files.isNotEmpty()){val i=selected.coerceIn(files.indices);val f=files[i];androidx.compose.foundation.Image(android.graphics.BitmapFactory.decodeFile(f.path).asImageBitmap(),"선택 이미지",Modifier.weight(1f).fillMaxWidth(),contentScale=ContentScale.Fit);Row{Button({if(i>0){setFiles(reorder(files,i,i-1));selected=i-1}},enabled=i>0){Text("앞으로")};Button({if(i<files.lastIndex){setFiles(reorder(files,i,i+1));selected=i+1}},enabled=i<files.lastIndex){Text("뒤로")};Button({f.delete();setFiles(files.filterIndexed{n,_->n!=i});selected=(i-1).coerceAtLeast(0)}){Text("삭제")}};Button({scope.launch{AppState.state.value=JobState.Processing;runCatching{withContext(Dispatchers.IO){ImageAndPdf.createPdf(context,files,c.crop,c.filename)}}.onSuccess{AppState.pdf.value=it;AppState.state.value=JobState.Completed;files.forEach(File::delete);setFiles(emptyList())}.onFailure{AppState.state.value=JobState.Error;AppState.message.value="PDF 생성 실패: ${it.message}"}}},Modifier.fillMaxWidth()){Text("PDF 만들기")};OutlinedButton({files.forEach(File::delete);setFiles(emptyList())},Modifier.fillMaxWidth()){Text("전체 폐기")}}
-        pdf?.let{(uri,name)->Text("저장 완료: 다운로드/Swipe2PDF/$name");Row{Button({runCatching{context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,"application/pdf").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))}.onFailure{AppState.message.value="PDF를 열 수 있는 앱을 찾지 못했습니다."}}){Text("PDF 열기")};Button({context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("application/pdf").putExtra(Intent.EXTRA_STREAM,uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),"PDF 공유"))}){Text("공유")};Button({context.startActivity(Intent(Intent.ACTION_VIEW,MediaStore.Downloads.EXTERNAL_CONTENT_URI))}){Text("저장 위치 보기")}}}}
+@Composable
+private fun PermissionRow(title: String, ok: Boolean, desc: String, action: () -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            Text(
+                "$title · ${if (ok) "허용됨" else "필요함"}", fontWeight = FontWeight.Bold,
+                color = if (ok) Color(0xff19794b) else MaterialTheme.colorScheme.error
+            )
+            Text(desc)
+            Button(action) { Text(if (ok) "설정 열기" else "허용하기") }
+        }
+    }
+}
+
+@Composable
+private fun ConfigScreen(c: JobConfig, sample: File?, canStart: Boolean, onChange: (JobConfig) -> Unit, onStart: () -> Unit) {
+    val context = LocalContext.current
+    val screenAspect = remember {
+        val b = context.getSystemService(WindowManager::class.java)!!.maximumWindowMetrics.bounds
+        b.width().toFloat() / b.height()
+    }
+    Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("캡처 설정", style = MaterialTheme.typography.headlineSmall)
+        NumberField("총 출력 페이지", c.pages.toLong(), 1L..999L) { onChange(c.copy(pages = it.toInt())) }
+        PercentSlider("스와이프 시작 X", c.startX) { onChange(c.copy(startX = it)) }
+        PercentSlider("스와이프 끝 X", c.endX) { onChange(c.copy(endX = it)) }
+        PercentSlider("스와이프 Y", c.y) { onChange(c.copy(y = it)) }
+        NumberField("제스처 시간(ms)", c.gestureMs, 100L..3000L) { onChange(c.copy(gestureMs = it)) }
+        NumberField("페이지 전환 대기(ms)", c.delayMs, 100L..10000L) { onChange(c.copy(delayMs = it)) }
+
+        Text("공통 자르기 영역", fontWeight = FontWeight.Bold)
+        CropPreview(c.crop, screenAspect, sample, Modifier.fillMaxWidth(.6f).align(Alignment.CenterHorizontally))
+        PercentSlider("위쪽", c.crop.top, 0f, c.crop.bottom - .02f) { onChange(c.copy(crop = c.crop.copy(top = it))) }
+        PercentSlider("아래쪽", c.crop.bottom, c.crop.top + .02f, 1f) { onChange(c.copy(crop = c.crop.copy(bottom = it))) }
+        PercentSlider("왼쪽", c.crop.left, 0f, c.crop.right - .02f) { onChange(c.copy(crop = c.crop.copy(left = it))) }
+        PercentSlider("오른쪽", c.crop.right, c.crop.left + .02f, 1f) { onChange(c.copy(crop = c.crop.copy(right = it))) }
+
+        OutlinedTextField(c.filename, { onChange(c.copy(filename = it)) }, label = { Text("출력 파일 이름") }, modifier = Modifier.fillMaxWidth())
+        Text("첫 화면을 먼저 캡처하며 ${c.pages}장 촬영 시 스와이프는 ${CapturePlan.swipesFor(c.pages)}회입니다.")
+        Button(onStart, Modifier.fillMaxWidth(), enabled = canStart) { Text("플로팅 컨트롤러 켜기") }
+    }
+}
+
+/** 실제 화면 비율의 틀 위에 자르기 영역을 그린다. 촬영본이 있으면 첫 장을 배경으로 보여 준다. */
+@Composable
+private fun CropPreview(crop: NormalizedRect, aspect: Float, sample: File?, modifier: Modifier) {
+    BoxWithConstraints(modifier.aspectRatio(aspect).background(Color(0xffdddddd))) {
+        sample?.let { f -> rememberBitmap(f, 800)?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) } }
+        Box(
+            Modifier
+                .offset(x = maxWidth * crop.left, y = maxHeight * crop.top)
+                .size(width = maxWidth * (crop.right - crop.left), height = maxHeight * (crop.bottom - crop.top))
+                .border(3.dp, Color.Red)
+        )
+    }
+}
+
+@Composable
+private fun NumberField(label: String, value: Long, range: LongRange, onValue: (Long) -> Unit) {
+    var text by remember(value) { mutableStateOf(value.toString()) }
+    val valid = text.toLongOrNull()?.let { it in range } == true
+    OutlinedTextField(
+        text,
+        { input ->
+            text = input.filter(Char::isDigit).take(6)
+            text.toLongOrNull()?.takeIf { it in range }?.let(onValue)
+        },
+        label = { Text("$label (${range.first}~${range.last})") },
+        isError = !valid,
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        modifier = Modifier.fillMaxWidth()
+    )
+}
+
+@Composable
+private fun PercentSlider(label: String, value: Float, min: Float = 0f, max: Float = 1f, onValue: (Float) -> Unit) {
+    Column {
+        Text("$label: ${(value * 100).toInt()}%")
+        Slider(value, onValue, valueRange = min..max)
+    }
+}
+
+private val thumbnailCache = LruCache<String, ImageBitmap>(80)
+
+/** 백그라운드에서 축소 디코딩한 이미지. 썸네일 크기는 캐시해 스크롤할 때 다시 읽지 않는다. */
+@Composable
+private fun rememberBitmap(file: File, maxSide: Int): ImageBitmap? {
+    val key = "${file.path}@$maxSide"
+    val cached = if (maxSide <= 300) thumbnailCache.get(key) else null
+    val bitmap by produceState(cached, key) {
+        if (value == null) {
+            value = withContext(Dispatchers.IO) { ImageAndPdf.decodeSampled(file, maxSide)?.asImageBitmap() }
+            if (maxSide <= 300) value?.let { thumbnailCache.put(key, it) }
+        }
+    }
+    return bitmap
+}
+
+@Composable
+private fun ReviewScreen(c: JobConfig, files: List<File>, state: JobState) {
+    val context = LocalContext.current
+    var selected by rememberSaveable { mutableIntStateOf(0) }
+    val fingerprints = remember { mutableStateMapOf<String, IntArray?>() }
+    LaunchedEffect(files) {
+        files.filter { it.path !in fingerprints }.forEach { f ->
+            fingerprints[f.path] = withContext(Dispatchers.IO) { ImageAndPdf.fingerprint(f) }
+        }
+    }
+    val duplicates by remember(files) { derivedStateOf { similarIndices(files.map { fingerprints[it.path] }) } }
+    val pdf by AppState.pdf.collectAsStateWithLifecycle()
+    val busy = state == JobState.Processing
+    val editable = state !in ACTIVE_STATES
+
+    Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("촬영 결과 ${files.size}장", style = MaterialTheme.typography.headlineSmall)
+        if (duplicates.isNotEmpty()) {
+            Text("유사한 연속 이미지가 있습니다: ${duplicates.sorted().map { it + 1 }.joinToString()}쪽", color = MaterialTheme.colorScheme.error)
+        }
+        if (files.isNotEmpty()) {
+            val i = selected.coerceIn(files.indices)
+            val f = files[i]
+            LazyRow(Modifier.height(130.dp)) {
+                itemsIndexed(files, key = { _, file -> file.path }) { n, file ->
+                    Card({ selected = n }, Modifier.width(90.dp).padding(3.dp)) {
+                        Column {
+                            Box(Modifier.height(90.dp).fillMaxWidth()) {
+                                rememberBitmap(file, 240)?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
+                            }
+                            Text("${n + 1}쪽${if (n in duplicates) " ⚠" else ""}", fontWeight = if (n == i) FontWeight.Bold else null)
+                        }
+                    }
+                }
+            }
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                rememberBitmap(f, 1600)?.let { Image(it, "선택 이미지", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Button({ AppState.captures.value = reorder(files, i, i - 1); selected = i - 1 }, enabled = editable && i > 0) { Text("앞으로") }
+                Button({ AppState.captures.value = reorder(files, i, i + 1); selected = i + 1 }, enabled = editable && i < files.lastIndex) { Text("뒤로") }
+                Button({
+                    f.delete()
+                    AppState.captures.value = files.filterIndexed { n, _ -> n != i }
+                    if (files.size == 1) AppState.moveTo(JobState.Idle)
+                    selected = (i - 1).coerceAtLeast(0)
+                }, enabled = editable) { Text("삭제") }
+            }
+            if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+            Button({ AppState.buildPdf(context, c) }, Modifier.fillMaxWidth(), enabled = editable) { Text(if (busy) "PDF 만드는 중…" else "PDF 만들기") }
+            OutlinedButton({ AppState.discardCaptures(); AppState.moveTo(JobState.Idle) }, Modifier.fillMaxWidth(), enabled = editable) { Text("전체 폐기") }
+        } else if (pdf == null) {
+            Text("아직 촬영한 이미지가 없습니다.")
+        }
+        pdf?.let { (uri, name) -> PdfResult(context, uri, name) }
+    }
+}
+
+@Composable
+private fun PdfResult(context: Context, uri: Uri, name: String) {
+    fun launch(intent: Intent, failure: String) {
+        runCatching { context.startActivity(intent) }.onFailure { AppState.message.value = failure }
+    }
+    Text("저장 완료: 다운로드/Swipe2PDF/$name")
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Button({
+            launch(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/pdf").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), "PDF를 열 수 있는 앱을 찾지 못했습니다.")
+        }) { Text("PDF 열기") }
+        Button({
+            val send = Intent(Intent.ACTION_SEND).setType("application/pdf").putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            launch(Intent.createChooser(send, "PDF 공유"), "공유할 수 있는 앱을 찾지 못했습니다.")
+        }) { Text("공유") }
+        Button({ launch(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS), "다운로드 폴더를 열 수 없습니다.") }) { Text("저장 위치 보기") }
+    }
 }
