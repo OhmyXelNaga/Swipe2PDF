@@ -21,7 +21,9 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
@@ -49,7 +51,7 @@ import java.io.File
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        AppState.restoreCaptures(filesDir)
+        AppState.restoreCaptures(this)
         setContent { MaterialTheme { SwipeApp() } }
     }
 }
@@ -207,6 +209,17 @@ private fun ConfigScreen(c: JobConfig, sample: File?, canStart: Boolean, onChang
         PercentSlider("오른쪽", c.crop.right, c.crop.left + .02f, 1f) { onChange(c.copy(crop = c.crop.copy(right = it))) }
 
         OutlinedTextField(c.filename, { onChange(c.copy(filename = it)) }, label = { Text("출력 파일 이름") }, modifier = Modifier.fillMaxWidth())
+        Text("PDF 분할", fontWeight = FontWeight.Bold)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            PdfPlan.SPLIT_OPTIONS.forEach { n ->
+                FilterChip(c.splitPages == n, { onChange(c.copy(splitPages = n)) }, label = { Text(if (n == 0) "나누지 않음" else "${n}장") })
+            }
+        }
+        Text(
+            if (c.splitPages == 0) "한 파일로 만들고, 완성된 뒤 촬영본을 지웁니다."
+            else "${c.splitPages}장마다 파일을 나눕니다. 묶음이 완성될 때마다 해당 촬영본을 지워 저장 공간을 아끼고, 중단돼도 완성된 파일은 남습니다.",
+            style = MaterialTheme.typography.bodySmall
+        )
         Text("첫 화면을 먼저 캡처하며 ${c.pages}장 촬영 시 스와이프는 ${CapturePlan.swipesFor(c.pages)}회입니다.")
         Button(onStart, Modifier.fillMaxWidth(), enabled = canStart) { Text("플로팅 컨트롤러 켜기") }
     }
@@ -279,7 +292,9 @@ private fun ReviewScreen(c: JobConfig, files: List<File>, state: JobState) {
         }
     }
     val duplicates by remember(files) { derivedStateOf { similarIndices(files.map { fingerprints[it.path] }) } }
-    val pdf by AppState.pdf.collectAsStateWithLifecycle()
+    val results by AppState.pdfResults.collectAsStateWithLifecycle()
+    val pdfProgress by AppState.pdfProgress.collectAsStateWithLifecycle()
+    val record by AppState.pdfRecord.collectAsStateWithLifecycle()
     val busy = state == JobState.Processing
     val editable = state !in ACTIVE_STATES
 
@@ -287,6 +302,9 @@ private fun ReviewScreen(c: JobConfig, files: List<File>, state: JobState) {
         Text("촬영 결과 ${files.size}장", style = MaterialTheme.typography.headlineSmall)
         if (duplicates.isNotEmpty()) {
             Text("유사한 연속 이미지가 있습니다: ${duplicates.sorted().map { it + 1 }.joinToString()}쪽", color = MaterialTheme.colorScheme.error)
+        }
+        record?.takeIf { it.nextPage > 1 && !busy && files.isNotEmpty() }?.let {
+            Text("이전 PDF 작업(${it.base})을 ${it.nextPage}쪽부터 이어서 만듭니다.", color = MaterialTheme.colorScheme.primary)
         }
         if (files.isNotEmpty()) {
             val i = selected.coerceIn(files.indices)
@@ -307,37 +325,50 @@ private fun ReviewScreen(c: JobConfig, files: List<File>, state: JobState) {
                 rememberBitmap(f, 1600)?.let { Image(it, "선택 이미지", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Button({ AppState.captures.value = reorder(files, i, i - 1); selected = i - 1 }, enabled = editable && i > 0) { Text("앞으로") }
-                Button({ AppState.captures.value = reorder(files, i, i + 1); selected = i + 1 }, enabled = editable && i < files.lastIndex) { Text("뒤로") }
+                Button({ AppState.setCaptures(reorder(files, i, i - 1)); selected = i - 1 }, enabled = editable && i > 0) { Text("앞으로") }
+                Button({ AppState.setCaptures(reorder(files, i, i + 1)); selected = i + 1 }, enabled = editable && i < files.lastIndex) { Text("뒤로") }
                 Button({
-                    f.delete()
-                    AppState.captures.value = files.filterIndexed { n, _ -> n != i }
-                    if (files.size == 1) AppState.moveTo(JobState.Idle)
+                    AppState.removeCapture(f)
                     selected = (i - 1).coerceAtLeast(0)
                 }, enabled = editable) { Text("삭제") }
             }
-            if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-            Button({ AppState.buildPdf(context, c) }, Modifier.fillMaxWidth(), enabled = editable) { Text(if (busy) "PDF 만드는 중…" else "PDF 만들기") }
+            pdfProgress?.let { (done, total) ->
+                Text("PDF 만드는 중 $done/${total}장")
+                LinearProgressIndicator({ if (total == 0) 0f else done.toFloat() / total }, Modifier.fillMaxWidth())
+            }
+            Button({ AppState.buildPdf(context, c) }, Modifier.fillMaxWidth(), enabled = editable) {
+                Text(if (busy) "PDF 만드는 중…" else "PDF 만들기")
+            }
             OutlinedButton({ AppState.discardCaptures(); AppState.moveTo(JobState.Idle) }, Modifier.fillMaxWidth(), enabled = editable) { Text("전체 폐기") }
-        } else if (pdf == null) {
+        } else if (results.isEmpty()) {
             Text("아직 촬영한 이미지가 없습니다.")
         }
-        pdf?.let { (uri, name) -> PdfResult(context, uri, name) }
+        if (results.isNotEmpty()) PdfResults(context, results)
     }
 }
 
 @Composable
-private fun PdfResult(context: Context, uri: Uri, name: String) {
+private fun PdfResults(context: Context, results: List<Pair<Uri, String>>) {
     fun launch(intent: Intent, failure: String) {
         runCatching { context.startActivity(intent) }.onFailure { AppState.message.value = failure }
     }
-    Text("저장 완료: 다운로드/Swipe2PDF/$name")
+    Text("저장 완료: 다운로드/Swipe2PDF/ (${results.size}개)", fontWeight = FontWeight.Bold)
+    LazyColumn(Modifier.heightIn(max = 180.dp)) {
+        items(results, key = { it.first.toString() }) { (uri, name) ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(name, Modifier.weight(1f))
+                TextButton({
+                    launch(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/pdf").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), "PDF를 열 수 있는 앱을 찾지 못했습니다.")
+                }) { Text("열기") }
+            }
+        }
+    }
     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         Button({
-            launch(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/pdf").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), "PDF를 열 수 있는 앱을 찾지 못했습니다.")
-        }) { Text("PDF 열기") }
-        Button({
-            val send = Intent(Intent.ACTION_SEND).setType("application/pdf").putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            val uris = ArrayList(results.map { it.first })
+            val send = if (uris.size == 1) Intent(Intent.ACTION_SEND).putExtra(Intent.EXTRA_STREAM, uris[0])
+            else Intent(Intent.ACTION_SEND_MULTIPLE).putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+            send.setType("application/pdf").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             launch(Intent.createChooser(send, "PDF 공유"), "공유할 수 있는 앱을 찾지 못했습니다.")
         }) { Text("공유") }
         Button({ launch(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS), "다운로드 폴더를 열 수 없습니다.") }) { Text("저장 위치 보기") }

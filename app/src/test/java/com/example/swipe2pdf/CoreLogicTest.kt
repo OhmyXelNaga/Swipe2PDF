@@ -67,7 +67,7 @@ class CoreLogicTest {
 
     @Test fun configRoundTripKeepsCommaInFilename() {
         val c = JobConfig(pages = 42, startX = .9f, endX = .1f, y = .4f, gestureMs = 250, delayMs = 1200,
-            crop = NormalizedRect(.1f, .2f, .8f, .9f), filename = "강의, 3주차")
+            crop = NormalizedRect(.1f, .2f, .8f, .9f), filename = "강의, 3주차", splitPages = 50)
         assertEquals(c, ConfigCodec.decode(ConfigCodec.encode(c)))
         assertEquals(JobConfig(), ConfigCodec.decode("broken"))
         assertEquals(JobConfig(), ConfigCodec.decode(null))

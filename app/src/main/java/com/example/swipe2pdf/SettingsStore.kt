@@ -23,6 +23,7 @@ class SettingsStore(private val context: Context) {
         val r = floatPreferencesKey("r")
         val b = floatPreferencesKey("b")
         val name = stringPreferencesKey("name")
+        val split = intPreferencesKey("split")
     }
 
     private val defaults = JobConfig()
@@ -32,7 +33,8 @@ class SettingsStore(private val context: Context) {
             p[K.pages] ?: defaults.pages, p[K.sx] ?: defaults.startX, p[K.ex] ?: defaults.endX, p[K.y] ?: defaults.y,
             p[K.gm] ?: defaults.gestureMs, p[K.dm] ?: defaults.delayMs,
             NormalizedRect(p[K.l] ?: defaults.crop.left, p[K.t] ?: defaults.crop.top, p[K.r] ?: defaults.crop.right, p[K.b] ?: defaults.crop.bottom),
-            p[K.name] ?: defaults.filename
+            p[K.name] ?: defaults.filename,
+            p[K.split] ?: defaults.splitPages
         )
     }
 
@@ -52,5 +54,6 @@ class SettingsStore(private val context: Context) {
         p[K.gm] = c.gestureMs; p[K.dm] = c.delayMs
         p[K.l] = c.crop.left; p[K.t] = c.crop.top; p[K.r] = c.crop.right; p[K.b] = c.crop.bottom
         p[K.name] = c.filename
+        p[K.split] = c.splitPages
     }
 }

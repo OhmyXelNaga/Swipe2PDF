@@ -1,17 +1,18 @@
 package com.example.swipe2pdf
 
+import android.content.ContentResolver
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.*
-import android.graphics.pdf.PdfDocument
 import android.net.Uri
+import android.os.Bundle
 import android.os.Environment
+import android.os.StatFs
 import android.provider.MediaStore
 import java.io.File
-import kotlin.math.max
 
 object ImageAndPdf {
-    private const val PDF_MAX_SIDE = 2000
     private const val FINGERPRINT_SIDE = 32
     private val pdfDir get() = "${Environment.DIRECTORY_DOWNLOADS}/Swipe2PDF/"
 
@@ -28,19 +29,33 @@ object ImageAndPdf {
         return BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sampleSizeFor(w, h, maxSide) })
     }
 
-    /** 공통 자르기 영역을 적용하되 PDF에 필요한 해상도보다 크게 디코딩하지 않는다. */
-    fun cropFile(source: File, crop: NormalizedRect, maxSide: Int = PDF_MAX_SIDE): Bitmap {
+    /** 공통 자르기 영역만 원본 해상도 그대로 읽는다. */
+    fun cropFile(source: File, crop: NormalizedRect): Bitmap {
         val (w, h) = bounds(source)
         require(w > 0 && h > 0 && crop.valid()) { "이미지를 읽을 수 없습니다: ${source.name}" }
-        val region = crop.pixels(w, h)
         val decoder = BitmapRegionDecoder.newInstance(source.path)
         try {
-            val options = BitmapFactory.Options().apply { inSampleSize = sampleSizeFor(region.width(), region.height(), maxSide) }
-            return decoder.decodeRegion(region, options) ?: error("이미지를 자를 수 없습니다.")
+            return decoder.decodeRegion(crop.pixels(w, h), BitmapFactory.Options()) ?: error("이미지를 자를 수 없습니다.")
         } finally {
             decoder.recycle()
         }
     }
+
+    /** 자른 이미지를 무손실 압축한다. 원본 비트맵은 압축 직후 해제한다. */
+    fun encodePage(source: File, crop: NormalizedRect): EncodedPage {
+        val bmp = cropFile(source, crop)
+        try {
+            val w = bmp.width
+            return encodeRgb(w, bmp.height) { y, row -> bmp.getPixels(row, 0, w, 0, y, w, 1) }
+        } finally {
+            bmp.recycle()
+        }
+    }
+
+    /** 동시에 압축할 페이지 수. 기록과 화면 처리용으로 코어 하나를 남긴다. */
+    fun parallelism() = (Runtime.getRuntime().availableProcessors() - 1).coerceIn(1, 4)
+
+    fun freeBytes(dir: File) = StatFs(dir.path).availableBytes
 
     /** 유사도 비교용 32×32 RGB 지문. 파일당 한 번만 계산해 재사용한다. */
     fun fingerprint(file: File): IntArray? {
@@ -70,7 +85,28 @@ object ImageAndPdf {
         return names
     }
 
-    fun createPdf(context: Context, files: List<File>, crop: NormalizedRect, requested: String): Pair<Uri, String> {
+    /** 이전 작업이 중단돼 남은 미완성 PDF(작성 중 표시)를 지운다. */
+    fun cleanupPending(context: Context) {
+        val resolver = context.contentResolver
+        val args = Bundle().apply {
+            putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.MediaColumns.RELATIVE_PATH}=?")
+            putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf(pdfDir))
+            putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_ONLY)
+        }
+        val ids = mutableListOf<Long>()
+        resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.MediaColumns._ID), args, null)
+            ?.use { c -> while (c.moveToNext()) ids += c.getLong(0) }
+        ids.forEach { runCatching { resolver.delete(ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, it), null, null) } }
+    }
+
+    /**
+     * [files]를 한 PDF로 만든다. 여러 장을 동시에 압축하고 페이지는 순서대로 바로 파일에 기록하므로
+     * 메모리 사용량은 페이지 수와 상관없이 일정하다. 실패하면 만들던 파일을 지운다.
+     */
+    suspend fun writePdf(
+        context: Context, files: List<File>, crop: NormalizedRect, requested: String,
+        onPage: (written: Int) -> Unit
+    ): Pair<Uri, String> {
         require(files.isNotEmpty())
         val resolver = context.contentResolver
         val name = uniqueName(existingNames(context), requested)
@@ -82,29 +118,20 @@ object ImageAndPdf {
         }
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: error("PDF 저장 위치를 만들 수 없습니다.")
         try {
-            val pdf = PdfDocument()
-            try {
-                val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-                files.forEachIndexed { index, file ->
-                    val bmp = cropFile(file, crop)
-                    val scale = minOf(1f, PDF_MAX_SIDE.toFloat() / max(bmp.width, bmp.height))
-                    val pw = max(1, (bmp.width * scale).toInt())
-                    val ph = max(1, (bmp.height * scale).toInt())
-                    val page = pdf.startPage(PdfDocument.PageInfo.Builder(pw, ph, index + 1).create())
-                    page.canvas.drawBitmap(bmp, null, Rect(0, 0, pw, ph), paint)
-                    pdf.finishPage(page)
-                    bmp.recycle()
+            (resolver.openOutputStream(uri, "w") ?: error("PDF 파일을 열 수 없습니다.")).use { stream ->
+                val writer = StreamingPdfWriter(stream)
+                orderedParallel(files, parallelism(), { encodePage(it, crop) }) { i, page ->
+                    writer.addPage(page)
+                    onPage(i + 1)
                 }
-                (resolver.openOutputStream(uri, "w") ?: error("PDF 파일을 열 수 없습니다.")).use(pdf::writeTo)
-            } finally {
-                pdf.close()
+                writer.finish()
             }
             values.clear()
             values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             resolver.update(uri, values, null, null)
             return uri to name
         } catch (t: Throwable) {
-            resolver.delete(uri, null, null)
+            runCatching { resolver.delete(uri, null, null) }
             throw t
         }
     }

@@ -31,6 +31,8 @@ class CaptureService : Service() {
         private const val NOTIFICATION_ID = 7
         private const val OVERLAY_HIDE_MS = 180L
         private const val FRAME_TIMEOUT_MS = 1500L
+        /** 촬영을 계속하려면 남겨 둘 최소 여유 공간. */
+        private const val MIN_FREE_BYTES = 200L * 1024 * 1024
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -58,6 +60,7 @@ class CaptureService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        AppState.init(this)
         val display = getSystemService(DisplayManager::class.java)!!.getDisplay(Display.DEFAULT_DISPLAY)
         windowContext = createWindowContext(display, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
         wm = windowContext.getSystemService(WindowManager::class.java)!!
@@ -137,6 +140,7 @@ class CaptureService : Service() {
             for (index in 0 until config.pages) {
                 while (paused) delay(100)
                 checkScreenUnchanged()
+                checkStorage()
                 val bitmap = grabFrame()
                 AppState.progress.value = (index + 1) to config.pages
                 updateOverlay()
@@ -160,6 +164,13 @@ class CaptureService : Service() {
         val bounds = wm.maximumWindowMetrics.bounds
         if (bounds.width() != screenWidth || bounds.height() != screenHeight) {
             throw IllegalStateException("기기 회전·접기 상태 또는 화면 크기가 바뀌었습니다. 촬영본을 보존했으니 작업을 다시 시작해 주세요.")
+        }
+    }
+
+    private fun checkStorage() {
+        val needed = screenWidth.toLong() * screenHeight * 4 + MIN_FREE_BYTES
+        if (ImageAndPdf.freeBytes(filesDir) < needed) {
+            throw IllegalStateException("저장 공간이 부족해 촬영을 멈췄습니다. 지금까지 촬영한 이미지는 보존했습니다.")
         }
     }
 
