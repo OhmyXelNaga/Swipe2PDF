@@ -2,7 +2,7 @@ name: Android build
 
 on:
   push:
-    branches: [ main ]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -15,11 +15,12 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
-      - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.11.1'
+          # 최신 sdkmanager에는 기본값에 들어 있는 'tools' 패키지가 없다.
+          packages: 'platform-tools'
+      - uses: gradle/actions/setup-gradle@v4
       - name: 단위 테스트 및 APK 빌드
-        run: gradle --no-daemon testDebugUnitTest assembleDebug
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
       - name: 테스트 결과 보관
         if: always()
         uses: actions/upload-artifact@v4
