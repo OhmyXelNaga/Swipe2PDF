@@ -30,8 +30,8 @@ data class JobConfig(
     val pages: Int = 10, val startX: Float = .85f, val endX: Float = .15f, val y: Float = .5f,
     val gestureMs: Long = 300, val delayMs: Long = 800,
     val crop: NormalizedRect = NormalizedRect(0f, .05f, 1f, .95f), val filename: String = "스캔",
-    /** PDF 한 파일에 넣을 최대 페이지 수. 0이면 나누지 않는다. */
-    val splitPages: Int = 100
+    /** 0이면 묶음 단위로 만든 뒤 한 파일로 합친다. 0보다 크면 그 장수마다 파일을 따로 저장한다. */
+    val splitPages: Int = 0
 )
 
 object CapturePlan {
@@ -61,6 +61,8 @@ object ConfigCodec {
 /** PDF 분할 규칙. 페이지 번호는 작업 전체 기준(1부터)이다. */
 object PdfPlan {
     val SPLIT_OPTIONS = listOf(0, 50, 100, 200)
+    /** 한 파일로 합칠 때 중간 파일 하나에 담는 장수. */
+    const val MERGE_CHUNK = 100
 
     /** 남은 [count]장을 [split]장씩 나눈 인덱스 범위. */
     fun chunks(count: Int, split: Int): List<IntRange> {
@@ -87,14 +89,23 @@ object PdfPlan {
     }
 }
 
-/** 이어서 만들기를 위한 PDF 진행 기록. [nextPage]부터 아직 만들지 않았다. */
-data class PdfRecord(val base: String, val split: Int, val nextPage: Int, val digits: Int)
+/** PDF 생성 진행률. [merging]이면 중간 파일을 한 파일로 합치는 단계다. */
+data class PdfProgress(val done: Int, val total: Int, val merging: Boolean = false)
+
+/**
+ * 이어서 만들기를 위한 PDF 진행 기록. [nextPage]부터 아직 만들지 않았다.
+ * 한 파일로 합치는 작업([split] 0)은 완성된 중간 파일 수를 [parts]에 기록한다.
+ */
+data class PdfRecord(val base: String, val split: Int, val nextPage: Int, val digits: Int, val parts: Int = 0) {
+    val merging get() = split <= 0
+    val started get() = nextPage > 1
+}
 
 /** 앱이 종료돼도 검토 순서와 PDF 진행 상황을 복구하기 위한 작업 기록. */
 data class JobRecord(val files: List<String>, val pdf: PdfRecord? = null) {
     fun encode() = buildString {
         append(HEADER).append('\n')
-        pdf?.let { append("pdf\t${it.split}\t${it.nextPage}\t${it.digits}\t${it.base}\n") }
+        pdf?.let { append("pdf2\t${it.split}\t${it.nextPage}\t${it.digits}\t${it.parts}\t${it.base}\n") }
         files.forEach { append("file\t").append(it).append('\n') }
     }
 
@@ -107,9 +118,13 @@ data class JobRecord(val files: List<String>, val pdf: PdfRecord? = null) {
             var pdf: PdfRecord? = null
             val files = mutableListOf<String>()
             for (line in lines.drop(1)) {
-                val parts = line.split('\t', limit = 5)
+                val parts = line.split('\t', limit = 6)
                 when (parts[0]) {
-                    "pdf" -> pdf = runCatching { PdfRecord(parts[4], parts[1].toInt(), parts[2].toInt(), parts[3].toInt()) }.getOrNull()
+                    "pdf" -> pdf = runCatching {
+                        val old = line.split('\t', limit = 5)
+                        PdfRecord(old[4], old[1].toInt(), old[2].toInt(), old[3].toInt())
+                    }.getOrNull()
+                    "pdf2" -> pdf = runCatching { PdfRecord(parts[5], parts[1].toInt(), parts[2].toInt(), parts[3].toInt(), parts[4].toInt()) }.getOrNull()
                     "file" -> parts.getOrNull(1)?.takeIf { it.isNotBlank() }?.let(files::add)
                 }
             }

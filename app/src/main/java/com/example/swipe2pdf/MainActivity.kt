@@ -68,7 +68,7 @@ fun SwipeApp() {
     val state by AppState.state.collectAsStateWithLifecycle()
     val captures by AppState.captures.collectAsStateWithLifecycle()
     val msg by AppState.message.collectAsStateWithLifecycle()
-    var tab by rememberSaveable { mutableIntStateOf(if (captures.isEmpty()) 0 else 2) }
+    var tab by rememberSaveable { mutableIntStateOf(if (AppState.canBuildPdf()) 2 else 0) }
     var projectionResult by remember { mutableStateOf<Pair<Int, Intent>?>(null) }
     var startAfterConsent by remember { mutableStateOf(false) }
 
@@ -117,7 +117,7 @@ fun SwipeApp() {
         }
     }
     LaunchedEffect(state) {
-        if (AppState.captures.value.isNotEmpty() && (state == JobState.Reviewing || state == JobState.Error)) tab = 2
+        if (AppState.canBuildPdf() && (state == JobState.Reviewing || state == JobState.Error)) tab = 2
     }
 
     Scaffold(topBar = { TopAppBar(title = { Text("Swipe2PDF") }) }) { pad ->
@@ -212,12 +212,12 @@ private fun ConfigScreen(c: JobConfig, sample: File?, canStart: Boolean, onChang
         Text("PDF 분할", fontWeight = FontWeight.Bold)
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             PdfPlan.SPLIT_OPTIONS.forEach { n ->
-                FilterChip(c.splitPages == n, { onChange(c.copy(splitPages = n)) }, label = { Text(if (n == 0) "나누지 않음" else "${n}장") })
+                FilterChip(c.splitPages == n, { onChange(c.copy(splitPages = n)) }, label = { Text(if (n == 0) "한 파일로 합치기" else "${n}장씩") })
             }
         }
         Text(
-            if (c.splitPages == 0) "한 파일로 만들고, 완성된 뒤 촬영본을 지웁니다."
-            else "${c.splitPages}장마다 파일을 나눕니다. 묶음이 완성될 때마다 해당 촬영본을 지워 저장 공간을 아끼고, 중단돼도 완성된 파일은 남습니다.",
+            if (c.splitPages == 0) "${PdfPlan.MERGE_CHUNK}장씩 나눠 만든 뒤 PDF 하나로 합칩니다. 중단돼도 이어서 만들고, 합친 뒤 중간 파일은 지웁니다."
+            else "${c.splitPages}장마다 파일을 따로 저장합니다. 중단돼도 완성된 파일은 남습니다.",
             style = MaterialTheme.typography.bodySmall
         )
         Text("첫 화면을 먼저 캡처하며 ${c.pages}장 촬영 시 스와이프는 ${CapturePlan.swipesFor(c.pages)}회입니다.")
@@ -303,8 +303,12 @@ private fun ReviewScreen(c: JobConfig, files: List<File>, state: JobState) {
         if (duplicates.isNotEmpty()) {
             Text("유사한 연속 이미지가 있습니다: ${duplicates.sorted().map { it + 1 }.joinToString()}쪽", color = MaterialTheme.colorScheme.error)
         }
-        record?.takeIf { it.nextPage > 1 && !busy && files.isNotEmpty() }?.let {
-            Text("이전 PDF 작업(${it.base})을 ${it.nextPage}쪽부터 이어서 만듭니다.", color = MaterialTheme.colorScheme.primary)
+        record?.takeIf { it.started && !busy }?.let {
+            Text(
+                if (files.isEmpty()) "이전 PDF 작업(${it.base})은 합치기만 남았습니다."
+                else "이전 PDF 작업(${it.base})을 ${it.nextPage}쪽부터 이어서 만듭니다.",
+                color = MaterialTheme.colorScheme.primary
+            )
         }
         if (files.isNotEmpty()) {
             val i = selected.coerceIn(files.indices)
@@ -332,12 +336,14 @@ private fun ReviewScreen(c: JobConfig, files: List<File>, state: JobState) {
                     selected = (i - 1).coerceAtLeast(0)
                 }, enabled = editable) { Text("삭제") }
             }
-            pdfProgress?.let { (done, total) ->
-                Text("PDF 만드는 중 $done/${total}장")
-                LinearProgressIndicator({ if (total == 0) 0f else done.toFloat() / total }, Modifier.fillMaxWidth())
+        }
+        if (files.isNotEmpty() || (record?.started == true && AppState.canBuildPdf())) {
+            pdfProgress?.let { p ->
+                Text("${if (p.merging) "PDF 합치는 중" else "PDF 만드는 중"} ${p.done}/${p.total}장")
+                LinearProgressIndicator({ if (p.total == 0) 0f else p.done.toFloat() / p.total }, Modifier.fillMaxWidth())
             }
             Button({ AppState.buildPdf(context, c) }, Modifier.fillMaxWidth(), enabled = editable) {
-                Text(if (busy) "PDF 만드는 중…" else "PDF 만들기")
+                Text(if (busy) "PDF 만드는 중…" else if (files.isEmpty()) "PDF 합치기 이어서 하기" else "PDF 만들기")
             }
             OutlinedButton({ AppState.discardCaptures(); AppState.moveTo(JobState.Idle) }, Modifier.fillMaxWidth(), enabled = editable) { Text("전체 폐기") }
         } else if (results.isEmpty()) {

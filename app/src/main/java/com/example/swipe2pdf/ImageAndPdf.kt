@@ -99,15 +99,8 @@ object ImageAndPdf {
         ids.forEach { runCatching { resolver.delete(ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, it), null, null) } }
     }
 
-    /**
-     * [files]를 한 PDF로 만든다. 여러 장을 동시에 압축하고 페이지는 순서대로 바로 파일에 기록하므로
-     * 메모리 사용량은 페이지 수와 상관없이 일정하다. 실패하면 만들던 파일을 지운다.
-     */
-    suspend fun writePdf(
-        context: Context, files: List<File>, crop: NormalizedRect, requested: String,
-        onPage: (written: Int) -> Unit
-    ): Pair<Uri, String> {
-        require(files.isNotEmpty())
+    /** 다운로드 폴더에 "작성 중" 파일을 만들고 [write]가 끝나면 공개한다. 실패하면 지운다. */
+    private inline fun saveToDownloads(context: Context, requested: String, write: (java.io.OutputStream) -> Unit): Pair<Uri, String> {
         val resolver = context.contentResolver
         val name = uniqueName(existingNames(context), requested)
         val values = ContentValues().apply {
@@ -118,14 +111,7 @@ object ImageAndPdf {
         }
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: error("PDF 저장 위치를 만들 수 없습니다.")
         try {
-            (resolver.openOutputStream(uri, "w") ?: error("PDF 파일을 열 수 없습니다.")).use { stream ->
-                val writer = StreamingPdfWriter(stream)
-                orderedParallel(files, parallelism(), { encodePage(it, crop) }) { i, page ->
-                    writer.addPage(page)
-                    onPage(i + 1)
-                }
-                writer.finish()
-            }
+            (resolver.openOutputStream(uri, "w") ?: error("PDF 파일을 열 수 없습니다.")).use(write)
             values.clear()
             values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             resolver.update(uri, values, null, null)
@@ -133,6 +119,46 @@ object ImageAndPdf {
         } catch (t: Throwable) {
             runCatching { resolver.delete(uri, null, null) }
             throw t
+        }
+    }
+
+    /** 여러 장을 동시에 압축하고 순서대로 [add]에 넘긴다. 메모리 사용량은 페이지 수와 상관없이 일정하다. */
+    private suspend fun encodeAll(files: List<File>, crop: NormalizedRect, onPage: (Int) -> Unit, add: (EncodedPage) -> Unit) {
+        orderedParallel(files, parallelism(), { encodePage(it, crop) }) { i, page ->
+            add(page)
+            onPage(i + 1)
+        }
+    }
+
+    /** [files]를 한 PDF로 만들어 다운로드 폴더에 저장한다. */
+    suspend fun writePdf(
+        context: Context, files: List<File>, crop: NormalizedRect, requested: String,
+        onPage: (written: Int) -> Unit
+    ): Pair<Uri, String> {
+        require(files.isNotEmpty())
+        return saveToDownloads(context, requested) { stream ->
+            val writer = StreamingPdfWriter(stream)
+            encodeAll(files, crop, onPage, writer::addPage)
+            writer.finish()
+        }
+    }
+
+    /** [files]를 압축해 앱 내부의 중간 파일 [target]에 저장한다. 완성되기 전에는 [target]이 생기지 않는다. */
+    suspend fun writePart(files: List<File>, crop: NormalizedRect, target: File, onPage: (Int) -> Unit) {
+        require(files.isNotEmpty())
+        PagePartFile.Writer(target).use { part ->
+            encodeAll(files, crop, onPage, part::add)
+            part.commit()
+        }
+    }
+
+    /** 중간 파일들을 다시 압축하지 않고 이어 붙여 PDF 하나로 저장한다. */
+    fun mergeParts(context: Context, parts: List<File>, requested: String, onPage: (Int) -> Unit): Pair<Uri, String> {
+        require(parts.isNotEmpty())
+        return saveToDownloads(context, requested) { stream ->
+            val writer = StreamingPdfWriter(stream)
+            parts.forEach { part -> PagePartFile.read(part) { writer.addPage(it); onPage(writer.pageCount) } }
+            writer.finish()
         }
     }
 }

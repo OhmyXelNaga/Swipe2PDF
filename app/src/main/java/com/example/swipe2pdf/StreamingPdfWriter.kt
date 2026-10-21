@@ -5,6 +5,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.EOFException
+import java.io.File
 import java.io.FilterOutputStream
 import java.io.OutputStream
 import java.util.Locale
@@ -130,6 +134,60 @@ class StreamingPdfWriter(output: OutputStream) {
     }
 
     private fun ascii(s: String) = out.write(s.toByteArray(Charsets.US_ASCII))
+}
+
+/**
+ * 한 파일로 합치기 전 묶음 단위로 저장하는 중간 파일. 압축된 페이지를 그대로 담아 두었다가
+ * 합칠 때 다시 압축하지 않고 PDF에 옮겨 쓴다. 다 쓴 뒤 이름을 바꿔 완성된 파일만 남긴다.
+ */
+object PagePartFile {
+    private const val MAGIC = 0x53325050 // "S2PP"
+
+    class Writer(private val target: File) : AutoCloseable {
+        private val tmp = File(target.path + ".tmp")
+        private val out = DataOutputStream(tmp.outputStream().buffered(1 shl 16)).apply { writeInt(MAGIC) }
+        private var committed = false
+
+        fun add(page: EncodedPage) {
+            out.writeInt(page.width)
+            out.writeInt(page.height)
+            out.writeInt(page.length)
+            out.write(page.data, 0, page.length)
+        }
+
+        /** 기록을 마치고 완성된 파일로 바꾼다. */
+        fun commit() {
+            out.close()
+            if (!tmp.renameTo(target)) error("중간 파일을 저장하지 못했습니다.")
+            committed = true
+        }
+
+        override fun close() {
+            if (!committed) {
+                runCatching { out.close() }
+                tmp.delete()
+            }
+        }
+    }
+
+    /** 페이지를 한 장씩 읽어 [consume]에 넘긴다. 메모리에는 한 장만 남는다. */
+    inline fun read(source: File, consume: (EncodedPage) -> Unit) {
+        DataInputStream(source.inputStream().buffered(1 shl 16)).use { input ->
+            require(input.readInt() == 0x53325050) { "손상된 중간 파일입니다: ${source.name}" }
+            while (true) {
+                val width = try { input.readInt() } catch (_: EOFException) { break }
+                val height = input.readInt()
+                val length = input.readInt()
+                val data = ByteArray(length)
+                input.readFully(data)
+                consume(EncodedPage(width, height, data, length))
+            }
+        }
+    }
+
+    fun name(index: Int) = String.format(Locale.ROOT, "part_%05d.bin", index)
+
+    fun index(name: String) = name.removePrefix("part_").removeSuffix(".bin").toIntOrNull()
 }
 
 /**

@@ -54,15 +54,16 @@ class PdfService : Service() {
         super.onDestroy()
     }
 
-    private fun notification(progress: Pair<Int, Int>?): Notification {
+    private fun notification(progress: PdfProgress?): Notification {
         val open = PendingIntent.getActivity(
             this, 1, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE
         )
-        val (done, total) = progress ?: (0 to 0)
+        val done = progress?.done ?: 0
+        val total = progress?.total ?: 0
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("PDF 만드는 중")
+            .setContentTitle(if (progress?.merging == true) "PDF 합치는 중" else "PDF 만드는 중")
             .setContentText(if (total > 0) "$done/${total}장" else "준비 중")
             .setProgress(total, done, total == 0)
             .setContentIntent(open)

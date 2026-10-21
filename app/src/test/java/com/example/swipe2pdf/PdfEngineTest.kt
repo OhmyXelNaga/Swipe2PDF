@@ -3,12 +3,16 @@ package com.example.swipe2pdf
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.InflaterInputStream
 
 class PdfEngineTest {
+    @get:Rule val tmp = TemporaryFolder()
+
     @Test fun chunksSplitRemainingPages() {
         assertEquals(listOf(0 until 100, 100 until 200, 200 until 250), PdfPlan.chunks(250, 100))
         assertEquals(listOf(0 until 250), PdfPlan.chunks(250, 0))
@@ -38,6 +42,11 @@ class PdfEngineTest {
     @Test fun jobRecordRoundTrip() {
         val r = JobRecord(listOf("100_2.png", "100_0.png"), PdfRecord("강의, 1장 (복습)", 100, 401, 3))
         assertEquals(r, JobRecord.decode(r.encode()))
+        val merging = JobRecord(listOf("a.png"), PdfRecord("강의", 0, 201, 3, parts = 2))
+        assertEquals(merging, JobRecord.decode(merging.encode()))
+        assertTrue(merging.pdf!!.merging && merging.pdf!!.started)
+        // 이전 버전 형식
+        assertEquals(PdfRecord("강의", 100, 401, 3), JobRecord.decode("swipe2pdf-job 1\npdf\t100\t401\t3\t강의\n")!!.pdf)
         assertEquals(JobRecord(listOf("a.png")), JobRecord.decode(JobRecord(listOf("a.png")).encode()))
         assertNull(JobRecord.decode("garbage"))
     }
@@ -95,5 +104,44 @@ class PdfEngineTest {
         }) { i, r -> seen += i to r }
         assertEquals((0 until 40).map { it to it * 10 }, seen)
         assertTrue("peak ${peak.get()}", peak.get() in 1..3)
+    }
+
+    private fun page(w: Int, h: Int, color: Int) = encodeRgb(w, h) { _, row -> row.fill(color) }
+
+    @Test fun partFileRoundTripKeepsPagesInOrder() {
+        val target = tmp.root.resolve(PagePartFile.name(0))
+        PagePartFile.Writer(target).use { w ->
+            w.add(page(3, 2, 0x112233))
+            w.add(page(5, 4, 0x445566))
+            w.commit()
+        }
+        assertFalse(tmp.root.resolve(target.name + ".tmp").exists())
+        val sizes = mutableListOf<Pair<Int, Int>>()
+        PagePartFile.read(target) { sizes += it.width to it.height }
+        assertEquals(listOf(3 to 2, 5 to 4), sizes)
+        assertEquals(0, PagePartFile.index(target.name))
+    }
+
+    @Test fun unfinishedPartLeavesNoFile() {
+        val target = tmp.root.resolve(PagePartFile.name(1))
+        PagePartFile.Writer(target).use { it.add(page(2, 2, 0)) }
+        assertFalse(target.exists())
+        assertFalse(tmp.root.resolve(target.name + ".tmp").exists())
+    }
+
+    @Test fun mergedPdfContainsAllPartsInOrder() {
+        val parts = (0 until 3).map { p ->
+            tmp.root.resolve(PagePartFile.name(p)).also { f ->
+                PagePartFile.Writer(f).use { w -> repeat(2) { n -> w.add(page(10 + p * 2 + n, 3, 0)) }; w.commit() }
+            }
+        }
+        val out = ByteArrayOutputStream()
+        val writer = StreamingPdfWriter(out)
+        parts.forEach { PagePartFile.read(it, writer::addPage) }
+        writer.finish()
+        val text = String(out.toByteArray(), Charsets.ISO_8859_1)
+        assertTrue(text.contains("/Count 6"))
+        val widths = Regex("/Subtype /Image /Width (\\d+)").findAll(text).map { it.groupValues[1].toInt() }.toList()
+        assertEquals(listOf(10, 11, 12, 13, 14, 15), widths)
     }
 }
